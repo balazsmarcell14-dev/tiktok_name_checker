@@ -18,12 +18,23 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 def generate_usernames(length: int, count: int = 10000) -> list:
-    """Generate random usernames with letters and numbers."""
-    characters = string.ascii_lowercase + string.digits
+    """Generate random usernames with letters, numbers, underscores and periods."""
+    characters = string.ascii_lowercase + string.digits + '_.'
     usernames = set()
     
     while len(usernames) < count:
-        username = ''.join(random.choices(characters, k=length))
+        # First char must be a letter or number (TikTok requirement)
+        first = random.choice(string.ascii_lowercase + string.digits)
+        # Last char must be a letter or number (can't end with _ or .)
+        last = random.choice(string.ascii_lowercase + string.digits)
+        if length <= 2:
+            username = first + last if length == 2 else first
+        else:
+            middle = ''.join(random.choices(characters, k=length - 2))
+            # Avoid consecutive _ or . 
+            while '..' in middle or '__' in middle or '._' in middle or '_.' in middle:
+                middle = ''.join(random.choices(characters, k=length - 2))
+            username = first + middle + last
         usernames.add(username)
     
     return list(usernames)
@@ -46,7 +57,7 @@ async def check_username(page, username: str) -> tuple:
         
         # Primary check: page title
         if "couldn't find" in title_lower:
-            return (username, True)   # Available
+            return (username, True)   # Possibly available (could be banned)
         elif f"@{username}" in title_lower:
             return (username, False)  # Taken
         
@@ -56,7 +67,7 @@ async def check_username(page, username: str) -> tuple:
             return (username, False)  # Taken
         
         if "couldn't find this account" in content.lower():
-            return (username, True)   # Available
+            return (username, True)   # Possibly available
         
         return (username, None)   # Ambiguous = error
         
@@ -65,7 +76,35 @@ async def check_username(page, username: str) -> tuple:
     except Exception as e:
         return (username, None)
 
-async def worker(browser, usernames: list, results: dict, progress: dict, total: int):
+async def verify_username_signup(page, username: str) -> bool:
+    """Verify username by checking TikTok's signup page username field."""
+    try:
+        # Navigate to signup page
+        await page.goto("https://www.tiktok.com/signup", wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(2000)
+        
+        # Try the username check via TikTok's internal API
+        result = await page.evaluate('''async (username) => {
+            try {
+                const response = await fetch(`https://www.tiktok.com/api/uniqueid/check/?uniqueId=${username}&aid=1988`, {
+                    method: 'GET',
+                    credentials: 'include'
+                });
+                const data = await response.json();
+                return data;
+            } catch(e) {
+                return null;
+            }
+        }''', username)
+        
+        if result and "isValid" in str(result):
+            return result.get("isValid", False)
+        
+        return None
+    except Exception:
+        return None
+
+async def worker(browser, usernames: list, results: dict, progress: dict, total: int, worker_id: int):
     """Worker that processes usernames with its own browser context."""
     global stop_flag
     
@@ -99,7 +138,71 @@ async def worker(browser, usernames: list, results: dict, progress: dict, total:
         
         # Small delay between requests
         if not stop_flag:
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(200)
+    
+    await context.close()
+
+async def verification_worker(browser, usernames: list, verified: list, progress: dict, total: int):
+    """Worker for verification round."""
+    global stop_flag
+    
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        viewport={"width": 1920, "height": 1080}
+    )
+    page = await context.new_page()
+    
+    for username in usernames:
+        if stop_flag:
+            break
+        
+        progress["checked"] += 1
+        print(f"\rVerifying: {progress['checked']}/{total} - @{username}    ", end="", flush=True)
+        
+        try:
+            # First try the API check
+            api_result = await verify_username_signup(page, username)
+            
+            if api_result is True:
+                verified.append(username)
+                await page.wait_for_timeout(500)
+                continue
+            elif api_result is False:
+                await page.wait_for_timeout(500)
+                continue
+            
+            # Fallback: re-check the profile page
+            url = f"https://www.tiktok.com/@{username}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(2500)
+            
+            title = await page.title()
+            title_lower = title.lower()
+            content = await page.content()
+            content_lower = content.lower()
+            
+            # Check for banned account indicators
+            banned_indicators = [
+                "account banned",
+                "account suspended",
+                "violated community guidelines",
+                "violation of our",
+                "permanently banned"
+            ]
+            is_banned = any(ind in content_lower for ind in banned_indicators)
+            
+            if is_banned:
+                continue  # Skip banned accounts
+            
+            # Re-check availability
+            if "couldn't find" in title_lower:
+                if f'"uniqueId":"{username}"' not in content:
+                    verified.append(username)
+                    
+        except Exception:
+            pass
+        
+        await page.wait_for_timeout(500)
     
     await context.close()
 
@@ -170,7 +273,7 @@ async def main_async():
             # Create worker tasks
             tasks = []
             for batch in batches:
-                task = asyncio.create_task(worker(browser, batch, results, progress, len(usernames)))
+                task = asyncio.create_task(worker(browser, batch, results, progress, len(usernames), i))
                 tasks.append(task)
             
             # Wait for all workers
@@ -200,58 +303,41 @@ async def main_async():
     print(f"Time elapsed: {elapsed_time:.2f} seconds")
     print()
     
-    # Verification round
+    # Verification round - multi-threaded with signup API check
     verified_available = []
     if results["available"] and not stop_flag:
         print(f"\n[VERIFICATION] Re-checking {len(results['available'])} available usernames...")
-        print("This ensures accuracy by checking each one twice.\n")
+        print("Checking if usernames are truly available (filtering banned accounts).\n")
+        
+        # Split available usernames among verification workers
+        available_list = results["available"]
+        verify_workers = min(3, len(available_list))
+        v_batch_size = len(available_list) // verify_workers
+        v_batches = []
+        for i in range(verify_workers):
+            start = i * v_batch_size
+            end = start + v_batch_size if i < verify_workers - 1 else len(available_list)
+            v_batches.append(available_list[start:end])
+        
+        v_progress = {"checked": 0}
         
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                    viewport={"width": 1920, "height": 1080}
-                )
-                page = await context.new_page()
                 
-                for i, username in enumerate(results["available"]):
-                    if stop_flag:
-                        break
-                    
-                    print(f"\rVerifying: {i+1}/{len(results['available'])} - @{username}", end="", flush=True)
-                    
-                    try:
-                        url = f"https://www.tiktok.com/@{username}"
-                        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                        await page.wait_for_timeout(2500)  # Wait longer for verification
-                        
-                        title = await page.title()
-                        title_lower = title.lower()
-                        
-                        # Primary: check page title
-                        if "couldn't find" in title_lower:
-                            verified_available.append(username)
-                        elif f"@{username}" in title_lower:
-                            pass  # Taken - don't add
-                        else:
-                            # Secondary: check content
-                            content = await page.content()
-                            if f'"uniqueId":"{username}"' in content:
-                                pass  # Taken
-                            elif "couldn't find this account" in content.lower():
-                                verified_available.append(username)
-                            
-                    except Exception as e:
-                        pass  # Skip on error during verification
-                    
-                    await page.wait_for_timeout(800)
+                v_tasks = []
+                for v_batch in v_batches:
+                    task = asyncio.create_task(
+                        verification_worker(browser, v_batch, verified_available, v_progress, len(available_list))
+                    )
+                    v_tasks.append(task)
                 
+                await asyncio.gather(*v_tasks)
                 await browser.close()
                 
         except Exception as e:
             print(f"\n[!] Verification error: {e}")
-            verified_available = results["available"]  # Fall back to original list
+            verified_available = results["available"]
         
         print("\n")
         
@@ -259,7 +345,7 @@ async def main_async():
         print(f"[VERIFICATION COMPLETE]")
         print(f"  Original available: {len(results['available'])}")
         print(f"  Verified available: {len(verified_available)}")
-        print(f"  False positives removed: {false_positives}")
+        print(f"  Banned/false positives removed: {false_positives}")
         print()
     else:
         verified_available = results["available"]
