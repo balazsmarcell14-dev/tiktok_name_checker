@@ -23,8 +23,8 @@ def generate_usernames(length: int, count: int = 10000) -> list:
     usernames = set()
     
     while len(usernames) < count:
-        # First char must be a letter or number (TikTok requirement)
-        first = random.choice(string.ascii_lowercase + string.digits)
+        # First char must be a letter (TikTok rule)
+        first = random.choice(string.ascii_lowercase)
         # Last char must be a letter or number (can't end with _ or .)
         last = random.choice(string.ascii_lowercase + string.digits)
         if length <= 2:
