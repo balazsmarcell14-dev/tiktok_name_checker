@@ -50,7 +50,7 @@ async def check_username(page, username: str) -> tuple:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
         
         # Wait for page to fully render
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1200)
         
         title = await page.title()
         title_lower = title.lower()
@@ -138,7 +138,7 @@ async def worker(browser, usernames: list, results: dict, progress: dict, total:
         
         # Small delay between requests
         if not stop_flag:
-            await page.wait_for_timeout(200)
+            await page.wait_for_timeout(100)
     
     await context.close()
 
@@ -240,11 +240,11 @@ async def main_async():
     # Get number of browser tabs
     while True:
         try:
-            workers = int(input("Enter number of browser tabs (1-5, default 3): ") or "3")
-            if 1 <= workers <= 5:
+            workers = int(input("Enter number of browser tabs (1-10, default 5): ") or "5")
+            if 1 <= workers <= 10:
                 break
             else:
-                print("Please enter a number between 1 and 5.")
+                print("Please enter a number between 1 and 10.")
         except ValueError:
             print("Please enter a valid number.")
     
@@ -272,7 +272,7 @@ async def main_async():
             
             # Create worker tasks
             tasks = []
-            for batch in batches:
+            for i, batch in enumerate(batches):
                 task = asyncio.create_task(worker(browser, batch, results, progress, len(usernames), i))
                 tasks.append(task)
             
@@ -303,70 +303,23 @@ async def main_async():
     print(f"Time elapsed: {elapsed_time:.2f} seconds")
     print()
     
-    # Verification round - multi-threaded with signup API check
-    verified_available = []
-    if results["available"] and not stop_flag:
-        print(f"\n[VERIFICATION] Re-checking {len(results['available'])} available usernames...")
-        print("Checking if usernames are truly available (filtering banned accounts).\n")
-        
-        # Split available usernames among verification workers
-        available_list = results["available"]
-        verify_workers = min(3, len(available_list))
-        v_batch_size = len(available_list) // verify_workers
-        v_batches = []
-        for i in range(verify_workers):
-            start = i * v_batch_size
-            end = start + v_batch_size if i < verify_workers - 1 else len(available_list)
-            v_batches.append(available_list[start:end])
-        
-        v_progress = {"checked": 0}
-        
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                
-                v_tasks = []
-                for v_batch in v_batches:
-                    task = asyncio.create_task(
-                        verification_worker(browser, v_batch, verified_available, v_progress, len(available_list))
-                    )
-                    v_tasks.append(task)
-                
-                await asyncio.gather(*v_tasks)
-                await browser.close()
-                
-        except Exception as e:
-            print(f"\n[!] Verification error: {e}")
-            verified_available = results["available"]
-        
-        print("\n")
-        
-        false_positives = len(results["available"]) - len(verified_available)
-        print(f"[VERIFICATION COMPLETE]")
-        print(f"  Original available: {len(results['available'])}")
-        print(f"  Verified available: {len(verified_available)}")
-        print(f"  Banned/false positives removed: {false_positives}")
-        print()
-    else:
-        verified_available = results["available"]
-    
-    # Save verified available usernames to file
-    if verified_available:
+    # Save available usernames from first pass only
+    if results["available"]:
         filename = f"available_usernames_{length}chars.txt"
         with open(filename, "w") as f:
-            for username in sorted(verified_available):
+            for username in sorted(results["available"]):
                 f.write(username + "\n")
-        print(f"Verified available usernames saved to: {filename}")
+        print(f"Available usernames saved to: {filename}")
     
-    # Show ALL verified available usernames
-    if verified_available:
-        print(f"\nAll {len(verified_available)} VERIFIED available usernames:")
+    # Show all available usernames
+    if results["available"]:
+        print(f"\nAll {len(results['available'])} available usernames:")
         print("-" * 30)
-        for username in sorted(verified_available):
+        for username in sorted(results["available"]):
             print(f"  @{username}")
         print("-" * 30)
     else:
-        print("\nNo verified available usernames found.")
+        print("\nNo available usernames found.")
     print("\n" + "=" * 50)
     input("Press Enter to exit...")
 
